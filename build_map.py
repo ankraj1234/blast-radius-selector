@@ -4,6 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path("/opt/sqlglot")
+COVERAGE = Path("/opt/coverage.json")
 OUT = Path("/opt/impact_map.json")
 
 test_paths = sorted(
@@ -95,10 +96,11 @@ for source in sorted((ROOT / "sqlglot").rglob("*.py")):
 
     module_prefix = ".".join(rel[:-3].split("/"))
     for test_rel, imports in test_imports.items():
-        if module_prefix in imports or any(
-            imported.startswith(module_prefix) or module_prefix.startswith(imported)
-            for imported in imports
-        ):
+        module_match = (
+            module_prefix in imports
+            or module_prefix.rpartition(".")[0] in imports
+        )
+        if module_match:
             candidates.add(test_rel)
 
     if stem in {"parser", "generator", "tokens", "transforms", "schema", "helper", "jsonpath", "expressions"}:
@@ -127,7 +129,11 @@ for source in sorted((ROOT / "sqlglot").rglob("*.py")):
     elif "/serde" in rel:
         candidates.update(test_rel for test_rel in test_paths if "serde" in test_rel)
     elif "/generators/" in rel:
-        candidates.update(test_rel for test_rel in test_paths if test_rel.startswith("tests/dialects/test_"))
+        candidates.update(test_rel for test_rel in test_paths if test_rel == f"tests/dialects/test_{stem}.py")
+        candidates.update(test_rel for test_rel in test_paths if test_rel in {
+            "tests/test_generator.py",
+            "tests/test_transpile.py",
+        })
 
     impact[rel] = sorted(candidates)
 
@@ -154,11 +160,48 @@ if fixtures_root.exists():
                 consumers.add(test_rel)
         fixture_consumers[rel_fixture] = sorted(consumers)
 
+coverage_lines: dict[str, dict[int, list[str]]] = {}
+coverage_ranges: dict[str, list[list]] = {}
+if COVERAGE.exists():
+    coverage = json.loads(COVERAGE.read_text(encoding="utf-8"))
+    for absolute, file_data in coverage.get("files", {}).items():
+        try:
+            rel = Path(absolute).relative_to(ROOT).as_posix()
+        except (ValueError, TypeError):
+            continue
+        if not rel.startswith("sqlglot/"):
+            continue
+        contexts = file_data.get("contexts", {})
+        for line_text, context_names in contexts.items():
+            nodes: set[str] = set()
+            for context in context_names:
+                node = context.split("|", 1)[0].strip()
+                if "::" in node:
+                    nodes.add(node)
+            if nodes:
+                coverage_lines.setdefault(rel, {})[int(line_text)] = sorted(nodes)
+
+for source in sorted((ROOT / "sqlglot").rglob("*.py")):
+    rel = source.relative_to(ROOT).as_posix()
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        continue
+    ranges: list[list] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            ranges.append([node.lineno, end, node.name])
+    if ranges:
+        coverage_ranges[rel] = ranges
+
 OUT.write_text(
     json.dumps({
         "dialects": dialect_closure,
         "impact": impact,
         "fixture_consumers": fixture_consumers,
+        "coverage_lines": coverage_lines,
+        "coverage_ranges": coverage_ranges,
     }),
     encoding="utf-8",
 )
