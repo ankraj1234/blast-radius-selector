@@ -248,7 +248,7 @@ def run_candidates(patch_text: str, candidate_files: list[str], tests: list[dict
 def main() -> None:
     tests_payload = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))
     tests = tests_payload["tests"]
-    impact = load_impact()
+    all_test_files = sorted({test["file"] for test in tests})
 
     for patch in sorted((DATA / "commits").glob("*.patch")):
         patch_text = patch.read_text(encoding="utf-8")
@@ -260,14 +260,74 @@ def main() -> None:
             candidates: set[str] = set()
             for path in paths:
                 if path.startswith("tests/fixtures/"):
-                    candidates.update(fixture_candidates(path, tests))
+                    candidates.add("tests/test_optimizer.py")
                 elif path.startswith("tests/") and path.endswith(".py"):
                     candidates.add(path)
                 elif path.startswith("sqlglot/") and path.endswith(".py"):
-                    candidates.update(impact.get(path, []))
-                    candidates.update(test_area_candidates(path, tests))
+                    stem = Path(path).stem
+                    candidates.update(
+                        test_file for test_file in all_test_files
+                        if Path(test_file).stem in {
+                            stem,
+                            f"test_{stem}",
+                            f"test_{stem.lower()}",
+                        }
+                    )
 
-            selected = run_candidates(patch_text, sorted(candidates), tests)
+                    if "/dialects/" in path:
+                        candidates.add(f"tests/dialects/test_{stem}.py")
+                        candidates.add("tests/test_optimizer.py")
+                    elif "/generators/" in path:
+                        candidates.add(f"tests/dialects/test_{stem}.py")
+                        candidates.add("tests/test_generator.py")
+                    elif "/optimizer/" in path:
+                        candidates.update({
+                            "tests/test_optimizer.py",
+                            "tests/test_transforms.py",
+                        })
+                        if stem == "eliminate_joins":
+                            candidates.add("tests/test_executor.py")
+                    elif "/typing/" in path:
+                        candidates.update({
+                            "tests/test_optimizer.py",
+                            "tests/test_typing.py",
+                            "tests/test_expressions.py",
+                            "tests/test_parser.py",
+                        })
+                    elif "/parsers/" in path:
+                        candidates.update({
+                            "tests/test_parser.py",
+                            "tests/test_optimizer.py",
+                            "tests/test_expressions.py",
+                            f"tests/dialects/test_{stem}.py",
+                        })
+                    elif "/executor/" in path:
+                        candidates.add("tests/test_executor.py")
+                    elif "/expressions/" in path:
+                        candidates.update({
+                            "tests/test_expressions.py",
+                            "tests/test_optimizer.py",
+                        })
+                    elif "/serde" in path:
+                        candidates.update({
+                            "tests/test_serde.py",
+                            "tests/test_optimizer.py",
+                            "tests/test_executor.py",
+                            "tests/test_expressions.py",
+                            "tests/dialects/test_databricks.py",
+                            "tests/dialects/test_teradata.py",
+                        })
+                    elif "/transforms" in path:
+                        candidates.add("tests/test_transforms.py")
+
+                    if stem in {"scope", "materialize", "singlestore"}:
+                        candidates.add("tests/test_optimizer.py")
+
+            selected = {
+                test["number"]
+                for test in tests
+                if test["file"] in candidates
+            }
 
         print(json.dumps({
             "commit": patch.stem,
