@@ -1,10 +1,27 @@
+import ast
 import json
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
 DATA = Path("/data")
 REPO = Path("/opt/sqlglot")
+MAP = Path("/opt/impact_map.json")
+
+CORE_MODULES = {
+    "sqlglot/parser.py",
+    "sqlglot/generator.py",
+    "sqlglot/tokens.py",
+    "sqlglot/expressions.py",
+    "sqlglot/schema.py",
+    "sqlglot/helper.py",
+    "sqlglot/jsonpath.py",
+    "sqlglot/transforms.py",
+    "sqlglot/dialects/dialect.py",
+}
 
 
 def patch_paths(patch_text: str) -> list[str]:
@@ -18,93 +35,23 @@ def patch_paths(patch_text: str) -> list[str]:
     return list(dict.fromkeys(paths))
 
 
-def patch_hunks(patch_text: str) -> dict[str, set[int]]:
-    result: dict[str, set[int]] = {}
-    current_path: str | None = None
-    new_line = 0
-    for line in patch_text.splitlines():
-        if line.startswith("diff --git "):
-            parts = line.split()
-            current_path = parts[3][2:] if len(parts) >= 4 and parts[3].startswith("b/") else (parts[3] if len(parts) >= 4 else None)
-            continue
-        if line.startswith("@@"):
-            try:
-                plus = line.split("+", 1)[1].split(" ", 1)[0]
-                new_line = int(plus.split(",", 1)[0])
-            except (IndexError, ValueError):
-                new_line = 0
-            continue
-        if current_path is None or new_line == 0:
-            continue
-        if line.startswith("+") and not line.startswith("+++"):
-            result.setdefault(current_path, set()).add(new_line)
-            new_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            continue
-        elif line.startswith(" "):
-            result.setdefault(current_path, set()).add(new_line)
-            new_line += 1
-
-    return result
-
-
-def changed_lines(patch_text: str) -> list[str]:
-    result: list[str] = []
-    for line in patch_text.splitlines():
-        if line.startswith(("+", "-")) and not line.startswith(("+++ ", "--- ")):
-            result.append(line[1:])
-    return result
-
-
-def is_comment_only(patch_text: str) -> bool:
-    for line in changed_lines(patch_text):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#") or stripped.startswith("//") or stripped.startswith("--"):
-            continue
-        if stripped.startswith(('"""', "'''")):
-            continue
-        return False
-    return True
-
-
-def node_matches_test(nodeid: str, test_id: str) -> bool:
-    node_base = nodeid.split("[", 1)[0]
-    test_base = test_id.split("[", 1)[0]
-    return node_base == test_base
-
-
-def node_numbers(nodes: set[str], tests: list[dict]) -> set[int]:
-    numbers: set[int] = set()
-    for node in nodes:
-        for test in tests:
-            if node_matches_test(node, test["id"]):
-                numbers.add(test["number"])
-    return numbers
-
-
-def fixture_candidates(path: str, tests: list[dict]) -> set[int]:
-    fixture = Path(path)
-    stem = fixture.stem
-    parent = fixture.parent.name
-    candidates: set[str] = set()
-    for test in tests:
-        test_path = REPO / test["file"]
-        try:
-            text = test_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if stem in text or parent in text:
-            candidates.add(test["file"])
-    return {test["number"] for test in tests if test["file"] in candidates}
-
-
-def split_workers(test_numbers: list[int], tests: list[dict], worker_count: int = 8) -> list[list[int]]:
+def split_workers(test_numbers: list[int], tests: list[dict]) -> list[list[int]]:
     if not test_numbers:
         return []
     duration = {test["number"]: test["seconds"] for test in tests}
-    worker_count = min(worker_count, len(test_numbers))
+    best_count = 1
+    best_cost = float("inf")
+    for worker_count in range(1, min(8, len(test_numbers)) + 1):
+        loads = [0.0] * worker_count
+        for number in sorted(test_numbers, key=lambda value: duration.get(value, 0.0), reverse=True):
+            lightest = min(range(worker_count), key=lambda index: loads[index])
+            loads[lightest] += duration.get(number, 0.0)
+        cost = max(loads) + 2.0 * worker_count
+        if cost < best_cost:
+            best_cost = cost
+            best_count = worker_count
+
+    worker_count = best_count
     workers: list[list[int]] = [[] for _ in range(worker_count)]
     loads = [0.0] * worker_count
     for number in sorted(test_numbers, key=lambda value: duration.get(value, 0.0), reverse=True):
@@ -114,218 +61,273 @@ def split_workers(test_numbers: list[int], tests: list[dict], worker_count: int 
     return [worker for worker in workers if worker]
 
 
-def exact_or_import_candidates(path: str, tests: list[dict], impact: dict[str, list[str]]) -> set[int]:
-    candidates = set(impact.get(path, []))
-    stem = Path(path).stem
-    candidates.update(
-        test["file"] for test in tests
-        if Path(test["file"]).stem in {stem, f"test_{stem}", f"test_{stem.lower()}"}
-    )
-    if "/dialects/" in path:
-        candidates.add(f"tests/dialects/test_{stem}.py")
-    if "/parsers/" in path:
-        candidates.add("tests/test_parser.py")
-    if "/optimizer/" in path:
-        candidates.add("tests/test_optimizer.py")
-    if "/executor/" in path:
-        candidates.add("tests/test_executor.py")
-    if "/serde" in path:
-        candidates.add("tests/test_serde.py")
-        candidates.update({
-            "tests/test_optimizer.py",
-            "tests/test_executor.py",
-            "tests/test_expressions.py",
-            "tests/dialects/test_databricks.py",
-            "tests/dialects/test_teradata.py",
-        })
-    if "/optimizer/" in path:
-        candidates.update({
-            "tests/test_optimizer.py",
-            "tests/test_executor.py",
-        })
-    if "/expressions/" in path:
-        candidates.add("tests/test_expressions.py")
-    return {test["number"] for test in tests if test["file"] in candidates}
+def ast_dump(path: Path) -> str | None:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        return ast.dump(tree, include_attributes=False)
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return None
 
 
-import ast
-import re
+def apply_patch_and_check(patch_text: str, paths: list[str]) -> tuple[bool, bool]:
+    """Returns (import_is_usable, ast_is_inert)."""
+    py_paths = [
+        path for path in paths
+        if (
+            path.startswith("sqlglot/")
+            or path.startswith("tests/")
+        )
+        and path.endswith(".py")
+    ]
+    if not py_paths:
+        return True
+
+    with tempfile.TemporaryDirectory(prefix="blast-", dir="/tmp") as temp_name:
+        temp = Path(temp_name)
+        patch_file = temp / "commit.patch"
+        patch_file.write_text(patch_text, encoding="utf-8")
+        shutil.copytree(
+            REPO / "sqlglot",
+            temp / "sqlglot",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        if (REPO / "tests").exists():
+            shutil.copytree(
+                REPO / "tests",
+                temp / "tests",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+
+        ast_before: dict[str, str | None] = {}
+        ast_after: dict[str, str | None] = {}
+        names = set(py_paths)
+        names.update(path for path in patch_paths(patch_text) if path.startswith("sqlglot/") and path.endswith(".py"))
+
+        for path in names:
+            source = REPO / path
+            if not source.is_file():
+                ast_before[path] = None
+                continue
+            ast_before[path] = ast_dump(source)
+
+        try:
+            subprocess.run(
+                ["patch", "-p1", "-d", str(temp), "-i", str(patch_file)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False, False
+
+        all_inert = True
+        for path in names:
+            target = temp / path
+            if not target.is_file():
+                all_inert = False
+                continue
+            ast_after[path] = ast_dump(target)
+            if ast_before[path] != ast_after[path]:
+                all_inert = False
+            if ast_after[path] is None:
+                return False, False
+
+        if all_inert:
+            return True, True
+
+        try:
+            env = {
+                "PYTHONPATH": str(temp),
+                "HOME": "/tmp",
+            }
+            import subprocess as sp
+            test_paths = [path for path in py_paths if path.startswith("tests/")]
+            code = (
+                "import sqlglot\n"
+                "import importlib.util\n"
+                f"test_paths = {test_paths!r}\n"
+                f"temp_root = {str(temp)!r}\n"
+                "for test_path in test_paths:\n"
+                "    full_path = temp_root + '/' + test_path\n"
+                "    spec = importlib.util.spec_from_file_location("
+                "'blast_radius_test_' + str(abs(hash(test_path))), full_path)\n"
+                "    if spec is None or spec.loader is None:\n"
+                "        raise ImportError(test_path)\n"
+                "    module = importlib.util.module_from_spec(spec)\n"
+                "    spec.loader.exec_module(module)\n"
+            )
+            result = sp.run(
+                [sys.executable, "-c", code],
+                cwd=str(temp),
+                env=env,
+                stdout=sp.DEVNULL,
+                stderr=sp.DEVNULL,
+                timeout=20,
+                check=False,
+            )
+            return result.returncode == 0, False
+        except (OSError, subprocess.TimeoutExpired):
+            return False, False
 
 
-def identifier_tokens(text: str) -> set[str]:
-    words = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text))
-    return {
-        word.lower().replace("_", "")
-        for word in words
-        if word.lower() not
-        in {
-            "the", "and", "for", "with", "from", "self", "this",
-            "else", "elif", "true", "false", "none", "not",
-        }
-    }
+def full_suite(tests: list[dict]) -> set[int]:
+    return {test["number"] for test in tests}
 
 
-def containing_symbols(path: str, line_numbers: set[int], ranges: dict[str, list[list]], symbols: dict[str, list[str]]) -> set[str]:
-    result: set[str] = set(symbols.get(path, []))
-    for line in line_numbers:
-        for start, end, name in ranges.get(path, []):
-            if start <= line <= end:
-                result.add(name)
+def test_files_for_direct_tests(paths: list[str], tests: list[dict]) -> set[int]:
+    result: set[int] = set()
+    for path in paths:
+        if path.startswith("tests/") and path.endswith(".py"):
+            result.update(test["number"] for test in tests if test["file"] == path)
     return result
 
 
-def test_numbers_matching(
-    candidate_files: set[str],
-    needles: set[str],
-    tests: list[dict],
-) -> set[int]:
-    matched: set[int] = set()
-    for test_file in candidate_files:
-        source = REPO / test_file
-        try:
-            text = source.read_text(encoding="utf-8")
-            tree = ast.parse(text)
-        except (OSError, UnicodeDecodeError, SyntaxError):
+def fixture_numbers(paths: list[str], tests: list[dict], fixture_map: dict[str, list[str]]) -> set[int]:
+    result: set[int] = set()
+    for path in paths:
+        if not path.startswith("tests/fixtures/"):
             continue
+        consumers = fixture_map.get(path, [])
+        if consumers:
+            result.update(test["number"] for test in tests if test["file"] in consumers)
+        else:
+            stem = Path(path).stem
+            result.update(test["number"] for test in tests if test["file"] == "tests/test_optimizer.py")
+            for test in tests:
+                try:
+                    text = (REPO / test["file"]).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    continue
+                if stem in text or Path(path).name in text:
+                    result.add(test["number"])
+    return result
 
-        methods: list[ast.AST] = []
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name.startswith("test"):
-                    methods.append(node)
 
-        if not methods:
-            matched.update(test["number"] for test in tests if test["file"] == test_file)
+def area_numbers(paths: list[str], tests: list[dict], impact: dict[str, list[str]]) -> set[int]:
+    result: set[int] = set()
+    all_test_files = sorted({test["file"] for test in tests})
+
+    for path in paths:
+        if not path.startswith("sqlglot/") or not path.endswith(".py"):
             continue
+        stem = Path(path).stem
+        candidates = set(impact.get(path, []))
+        candidates.update(
+            test_file for test_file in all_test_files
+            if Path(test_file).stem in {
+                stem,
+                f"test_{stem}",
+                f"test_{stem.lower()}",
+            }
+        )
 
-        file_matched = False
-        for method in methods:
-            method_name = method.name.lower().replace("_", "")
-            try:
-                method_text = ast.get_source_segment(text, method) or method.name
-            except (AttributeError, ValueError):
-                method_text = method.name
-            haystack = (method_name + " " + method_text.lower()).replace("_", "")
-            if any(needle in haystack for needle in needles):
-                matched.update(
-                    test["number"] for test in tests
-                    if test["file"] == test_file
-                    and test["id"].split("::")[-1].split("[", 1)[0].lower().replace("_", "") == method_name
-                )
-                file_matched = True
+        if path in CORE_MODULES:
+            return full_suite(tests)
 
-        if not file_matched:
-            matched.update(test["number"] for test in tests if test["file"] == test_file)
+        if "/dialects/" in path:
+            candidates.update(test_file for test_file in all_test_files if test_file.startswith("tests/dialects/test_"))
+            candidates.update({
+                "tests/test_dialect.py",
+                "tests/test_parser.py",
+                "tests/test_generator.py",
+                "tests/test_transpile.py",
+                "tests/test_optimizer.py",
+            })
+        elif "/optimizer/" in path:
+            candidates.update(test_file for test_file in all_test_files if "optimizer" in test_file or "scope" in test_file)
+        elif "/executor/" in path:
+            candidates.update(test_file for test_file in all_test_files if "executor" in test_file)
+        elif "/typing/" in path:
+            candidates.update(test_file for test_file in all_test_files if "typing" in test_file or "optimizer" in test_file)
+        elif "/expressions/" in path:
+            candidates.update(test_file for test_file in all_test_files if "expressions" in test_file)
+        elif "/parsers/" in path:
+            candidates.update({
+                "tests/test_parser.py",
+                "tests/test_optimizer.py",
+                "tests/test_expressions.py",
+            })
+            candidates.update(test_file for test_file in all_test_files if test_file.startswith("tests/dialects/test_"))
+        elif "/generators/" in path:
+            candidates.update(test_file for test_file in all_test_files if test_file.startswith("tests/dialects/test_"))
+            candidates.add("tests/test_generator.py")
+            candidates.add("tests/test_transpile.py")
+        elif "/serde" in path:
+            candidates.update(test_file for test_file in all_test_files if "serde" in test_file)
+            candidates.add("tests/test_optimizer.py")
+            candidates.add("tests/test_expressions.py")
+        elif "/transforms" in path:
+            candidates.update(test_file for test_file in all_test_files if "transforms" in test_file)
+            candidates.update(test_file for test_file in all_test_files if "transpile" in test_file)
 
-    return matched
+        result.update(test["number"] for test in tests if test["file"] in candidates)
+
+    return result
 
 
 def main() -> None:
     tests_payload = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))
     tests = tests_payload["tests"]
-    all_test_files = sorted({test["file"] for test in tests})
+    impact_map = json.loads(MAP.read_text(encoding="utf-8")) if MAP.exists() else {}
+    impact = impact_map.get("impact", {})
+    fixture_map = impact_map.get("fixture_consumers", {})
 
     for patch in sorted((DATA / "commits").glob("*.patch")):
         patch_text = patch.read_text(encoding="utf-8")
+        paths = patch_paths(patch_text)
+
+        recognized = True
         selected: set[int] = set()
-        if not is_comment_only(patch_text):
-            candidates: set[str] = set()
-            for path in patch_paths(patch_text):
-                if path.startswith("tests/fixtures/"):
-                    fixture = Path(path)
-                    stem = fixture.stem
-                    optimizer_path = REPO / "tests/test_optimizer.py"
-                    try:
-                        optimizer_text = optimizer_path.read_text(encoding="utf-8")
-                        optimizer_tree = ast.parse(optimizer_text)
-                    except (OSError, UnicodeDecodeError, SyntaxError):
-                        optimizer_text = ""
-                        optimizer_tree = None
 
-                    fixture_matched = False
-                    if optimizer_tree is not None:
-                        needle = stem.lower().replace("_", "")
-                        for node in ast.walk(optimizer_tree):
-                            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                continue
-                            if not node.name.startswith("test"):
-                                continue
-                            method_name = node.name.lower().replace("_", "")
-                            try:
-                                method_text = ast.get_source_segment(optimizer_text, node) or node.name
-                            except (AttributeError, ValueError):
-                                method_text = node.name
-                            if needle in (method_name + " " + method_text.lower()).replace("_", ""):
-                                selected.update(
-                                    test["number"] for test in tests
-                                    if test["file"] == "tests/test_optimizer.py"
-                                    and test["id"].split("::")[-1].split("[", 1)[0].lower().replace("_", "") == method_name
-                                )
-                                fixture_matched = True
-                    if not fixture_matched:
-                        candidates.add("tests/test_optimizer.py")
-                    continue
-                if not path.startswith("sqlglot/") or not path.endswith(".py"):
-                    continue
+        for path in paths:
+            if path.startswith("sqlglot/"):
+                continue
+            if path.startswith("tests/fixtures/"):
+                continue
+            if path.startswith("tests/") and path.endswith(".py"):
+                continue
+            recognized = False
 
-                stem = Path(path).stem
-                candidates.update(
-                    test_file for test_file in all_test_files
-                    if Path(test_file).stem in {
-                        stem,
-                        f"test_{stem}",
-                        f"test_{stem.lower()}",
-                    }
+        if not recognized:
+            selected = full_suite(tests)
+        else:
+            test_numbers = test_files_for_direct_tests(paths, tests)
+            selected.update(test_numbers)
+
+            if any(path.startswith("tests/") and path.endswith(".py") for path in paths):
+                if any(
+                    Path(path).name in {"helpers.py", "conftest.py", "__init__.py"}
+                    for path in paths
+                ):
+                    selected = full_suite(tests)
+
+            selected.update(fixture_numbers(paths, tests, fixture_map))
+            selected.update(area_numbers(paths, tests, impact))
+
+            py_paths = [
+                path for path in paths
+                if (
+                    path.startswith("sqlglot/")
+                    or path.startswith("tests/")
                 )
-                if "/dialects/" in path:
-                    candidates.add(f"tests/dialects/test_{stem}.py")
-                    candidates.add("tests/test_optimizer.py")
-                elif "/generators/" in path:
-                    candidates.add("tests/test_generator.py")
-                    candidates.update(test_file for test_file in all_test_files if test_file.startswith("tests/dialects/test_"))
-                elif "/optimizer/" in path:
-                    candidates.update({"tests/test_optimizer.py", "tests/test_transforms.py"})
-                    if stem == "eliminate_joins":
-                        candidates.add("tests/test_executor.py")
-                elif "/typing/" in path:
-                    candidates.update({
-                        "tests/test_optimizer.py",
-                        "tests/test_typing.py",
-                        "tests/test_expressions.py",
-                        "tests/test_parser.py",
-                    })
-                elif "/parsers/" in path:
-                    candidates.update({
-                        "tests/test_parser.py",
-                        "tests/test_optimizer.py",
-                        "tests/test_expressions.py",
-                        f"tests/dialects/test_{stem}.py",
-                    })
-                elif "/executor/" in path:
-                    candidates.add("tests/test_executor.py")
-                elif "/expressions/" in path:
-                    candidates.update({"tests/test_expressions.py", "tests/test_optimizer.py"})
-                if "/serde" in path:
-                    candidates.update({
-                        "tests/test_serde.py",
-                        "tests/test_optimizer.py",
-                        "tests/test_executor.py",
-                        "tests/test_expressions.py",
-                        "tests/dialects/test_databricks.py",
-                        "tests/dialects/test_teradata.py",
-                    })
-                if "/transforms" in path:
-                    candidates.add("tests/test_transforms.py")
-
-            if candidates:
-                selected.update(test["number"] for test in tests if test["file"] in candidates)
+                and path.endswith(".py")
+            ]
+            if py_paths:
+                import_usable, ast_inert = apply_patch_and_check(patch_text, py_paths)
+                if ast_inert:
+                    selected.clear()
+                    selected.update(test_numbers)
+                    selected.update(fixture_numbers(paths, tests, fixture_map))
+                elif not import_usable:
+                    selected = full_suite(tests)
 
         print(json.dumps({
             "commit": patch.stem,
             "workers": split_workers(sorted(selected), tests),
         }))
 
-    print("coverage selector complete", file=sys.stderr)
+    print("safe selector complete", file=sys.stderr)
 
 
 if __name__ == "__main__":

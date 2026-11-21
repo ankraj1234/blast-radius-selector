@@ -460,3 +460,49 @@ Design and implement a build-time import/call/AST impact graph that is general a
 6. avoid broad whole-repository pytest execution
 
 The target is substantial improvement over the 672.572 practice score and, more importantly, fewer than 6 hidden-batch misses.
+
+## Revised implementation status - 2026-11-21
+
+The diagnosis supplied by the revised plan was implemented, with important corrections:
+
+1. Unknown paths now escape to the full suite.
+   - Any changed path outside recognized SQLGlot source, SQLGlot test Python, and fixture areas selects all tests.
+
+2. Test Python files are direct selectors.
+   - A changed test file selects tests from that file.
+   - `tests/helpers.py`, `tests/conftest.py`, and `tests/__init__.py` select the full suite.
+
+3. Comment-only detection was replaced for `.py` source.
+   - The selector copies the SQLGlot package and changed test files into `/tmp`.
+   - It applies the unified patch.
+   - It compares AST dumps before and after.
+   - AST-identical Python changes select no tests.
+   - Syntax/import failure escalates to the full suite.
+
+4. Core modules escalate to the full suite.
+   - `parser.py`, `generator.py`, `tokens.py`, `dialects/dialect.py`, `expressions.py`, `schema.py`, `helper.py`, `jsonpath.py`, and `transforms.py` are explicitly conservative.
+
+5. Dialect inheritance is derived in `build_map.py`.
+   - Dialect class bases are parsed.
+   - Descendant closure is stored in the build artifact.
+   - A dialect source patch adds its descendant test files and shared dialect/parser/generator/transpile/optimizer tests.
+
+6. Fixture consumers are derived.
+   - The build map scans test source for each fixture name and relative fixture path.
+   - Fixture patches select resolved consuming test files.
+   - Unresolved fixtures fall back to optimizer and text matches.
+
+7. Worker count is optimized.
+   - The selector tries 1 through 8 workers.
+   - It chooses the makespan plus 2 seconds per worker that minimizes cost.
+
+8. The build artifact is now used.
+   - `/opt/impact_map.json` supplies source import/area impact and fixture consumers.
+
+Current validated result after this revised implementation:
+
+- `make sample`: 757.736 seconds
+- Practice misses: 0
+- Container runtime: about 10.8 seconds
+
+This is currently more conservative than the older 672.572 heuristic but closes the identified hidden leaks.
