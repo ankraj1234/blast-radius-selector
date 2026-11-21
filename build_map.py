@@ -4,87 +4,76 @@ from pathlib import Path
 
 
 ROOT = Path("/opt/sqlglot")
-TEST_ROOT = ROOT / "tests"
-OUT = Path("/opt/impact.json")
+OUT = Path("/opt/coverage_map.json")
 
+test_paths = sorted(
+    path.relative_to(ROOT).as_posix()
+    for path in (ROOT / "tests").rglob("*.py")
+    if "__pycache__" not in path.parts
+)
 
-def test_files() -> list[Path]:
-    return sorted(
-        path
-        for path in TEST_ROOT.rglob("*.py")
-        if "__pycache__" not in path.parts
-    )
-
-
-def relative_module(path: Path) -> str:
-    return ".".join(path.with_suffix("").parts)
-
-
-def imported_modules(path: Path) -> set[str]:
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-    except (SyntaxError, UnicodeDecodeError):
-        return set()
-
-    result: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            result.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                continue
-            if node.module:
-                result.add(node.module)
-                result.update(f"{node.module}.{alias.name}" for alias in node.names)
-    return result
-
-
-def module_matches(module: str, source: str) -> bool:
-    module_path = module.replace(".", "/")
-    source_stem = source.removesuffix(".py")
-    return module_path == source_stem or module_path.startswith(source_stem)
-
-
-files = test_files()
+ranges: dict[str, list[list]] = {}
+symbols: dict[str, list[str]] = {}
 impact: dict[str, list[str]] = {}
-test_paths = {path.relative_to(ROOT).as_posix() for path in files}
 
 for source in sorted((ROOT / "sqlglot").rglob("*.py")):
-    source_rel = source.relative_to(ROOT).as_posix()
-    source_stem = source.stem
+    rel = source.relative_to(ROOT).as_posix()
+    stem = source.stem
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        continue
+
+    source_ranges: list[list] = []
+    source_symbols: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            source_ranges.append([node.lineno, end, node.name])
+            source_symbols.add(node.name)
+    if source_ranges:
+        ranges[rel] = source_ranges
+    if source_symbols:
+        symbols[rel] = sorted(source_symbols)
+
     candidates: set[str] = set()
-    source_text = source_rel
-
-    for test_path in files:
-        test_rel = test_path.relative_to(ROOT).as_posix()
-        imports = imported_modules(test_path)
-        if any(module_matches(module, source_rel[len("sqlglot/"):-3]) for module in imports):
+    for test_rel in test_paths:
+        test_path = ROOT / test_rel
+        try:
+            text = test_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if stem in test_rel:
+            candidates.add(test_rel)
+        if stem in text:
             candidates.add(test_rel)
 
-        test_stem = test_path.stem
-        if test_stem == f"test_{source_stem}" or test_stem == source_stem:
-            candidates.add(test_rel)
-
-    area = source_rel.split("/")[1] if len(source_rel.split("/")) > 1 else ""
-    if area == "dialects":
-        if source_stem in {"dialect", "dialect"}:
-            candidates.update(test for test in test_paths if test.startswith("tests/dialects/test_"))
-    elif area == "optimizer":
+    if "/dialects/" in rel:
+        candidates.update(test for test in test_paths if test == f"tests/dialects/test_{stem}.py")
         candidates.update(test for test in test_paths if "optimizer" in test)
-    elif area == "executor":
+    elif "/optimizer/" in rel:
+        candidates.update(test for test in test_paths if "optimizer" in test)
+    elif "/executor/" in rel:
         candidates.update(test for test in test_paths if "executor" in test)
-    elif area == "typing":
-        candidates.update(
-            test for test in test_paths
-            if "typing" in test or "optimizer" in test
-        )
-    elif area == "expressions":
-        candidates.update(test for test in test_paths if test.endswith("test_expressions.py"))
-    elif area == "generators":
-        candidates.update(test for test in test_paths if test.endswith("test_generator.py"))
-    elif area == "parsers":
-        candidates.update(test for test in test_paths if test.endswith("test_parser.py"))
+    elif "/typing/" in rel:
+        candidates.update(test for test in test_paths if "typing" in test or "optimizer" in test)
+    elif "/expressions/" in rel:
+        candidates.update(test for test in test_paths if "expressions" in test)
+    elif "/parsers/" in rel:
+        candidates.update(test for test in test_paths if test.endswith("test_parser.py") or test == f"tests/dialects/test_{stem}.py")
+    elif "/serde" in rel:
+        candidates.update(test for test in test_paths if "serde" in test)
+    elif "/generator" in rel or "/generators/" in rel:
+        candidates.update(test for test in test_paths if test.startswith("tests/dialects/test_"))
 
-    impact[source_rel] = sorted(candidates)
+    impact[rel] = sorted(candidates)
 
-OUT.write_text(json.dumps({"impact": impact}), encoding="utf-8")
+OUT.write_text(
+    json.dumps({
+        "lines": {},
+        "ranges": ranges,
+        "symbols": symbols,
+        "impact": impact,
+    }),
+    encoding="utf-8",
+)

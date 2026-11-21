@@ -15,7 +15,9 @@ RUN git init /opt/sqlglot \
     && git checkout FETCH_HEAD
 
 COPY build_map.py /tmp/build_map.py
-RUN cd /opt/sqlglot && pip install --no-cache-dir -e . && python /tmp/build_map.py
+RUN cd /opt/sqlglot \
+    && pip install --no-cache-dir -e . \
+    && python /tmp/build_map.py
 
 COPY selector.py /app/selector.py
 CMD ["python", "/app/selector.py"]
